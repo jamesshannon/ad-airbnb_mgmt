@@ -11,13 +11,7 @@ from appdaemon.plugins.hass import Hass # pyright: ignore
 # pyright: reportUnknownMemberType=false
 
 MY_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(MY_DIR, 'state')
-
-class Unit(t.TypedDict):
-  name: str
-  code: str
-  cal_code: str
-  thermostat_key: str
+DB_BASE = os.path.join(MY_DIR, 'state')
 
 class CalendarEventInfo(t.TypedDict):
   """ Data about each Rental Control calendar event
@@ -42,7 +36,7 @@ class AirbnbManagement(Hass):
     """AppDaemon app initialization
     Create/open the database and begin executing the checks
     """
-    self.db = shelve.open(DB_PATH)
+    self.db = shelve.open(f'{ DB_BASE }_{ self.name }')
     self.log(dict(self.db.items()))
 
     self.check_interval_mins: int = \
@@ -55,12 +49,18 @@ class AirbnbManagement(Hass):
     self.cleaner_check_time: time = \
         time.fromisoformat(
             t.cast(str, self.args.get('cleaner_check_time', '14:00:00')))
-    self.units = t.cast(list[Unit], self.args.get('units'))
+
+
+    # Expect all unit parameters as top-level args
+    self.unit: dict[str, str] = {
+      'name': self.args['name'],
+      'code': self.args['code'],
+      'cal_code': self.args['cal_code'],
+      'thermostat_key': self.args['thermostat_key'],
+    }
 
     # Execute the checks immediately, and every x minutes
-    self.run_in(self.check_mgmt, delay=2)
     self.run_every(self.check_mgmt, interval=(self.check_interval_mins * 60))
-
 
   def terminate(self):
     """ AppDaemon app cleanup
@@ -69,20 +69,20 @@ class AirbnbManagement(Hass):
     """
     self.db.close()
 
-  def check_mgmt(self, **kwargs):
+  def check_mgmt(self, **kwargs: dict[str, t.Any]):
     self.log('Executing STR Management activities')
 
-    for unit in self.units:
-      rental_events = self._get_rental_events(unit['cal_code'])
+    # Get the relevant rental events for this unit
+    rental_events = self._get_rental_events(self.unit['cal_code'])
 
-      self.reset_checkin_time(unit)
+    self.reset_checkin_time()
 
-      if rental_events['checkout_today_evt']:
-        self.hvac_off(unit)
+    if rental_events['checkout_today_evt']:
+      self.hvac_off()
 
-      if rental_events['checkin_today_evt']:
-        self.cleaner_alert(unit)
-        self.hvac_on(unit)
+    if rental_events['checkin_today_evt']:
+      self.cleaner_alert()
+      self.hvac_on()
 
   def _get_rental_events(self, unit_code: str) -> RentalEventInfo:
     """ Calculate the checkin / active / checkout rental control events
@@ -140,22 +140,19 @@ class AirbnbManagement(Hass):
     }
 
 
-  def reset_checkin_time(self, unit: Unit):
+  def reset_checkin_time(self):
     """ Reset the checkin time input entity.
     This happens every day right after midnight; the custom checkin time won't
     persist across days.
-
-    Args:
-        unit (Unit): The unit
     """
     # TODO: Only reset after checkin
-    ent_key_checkin_time = f'input_datetime.str_{ unit['code'] }_checkin_time'
-    db_key = f'{ unit['code'] }_last_checkin_reset'
+    ent_key_checkin_time = (f'input_datetime.str_{ self.unit['code'] }_'
+                            'checkin_time')
+    db_key = 'last_checkin_reset'
 
     # By comparing dates then this will execute right after midnight
     if not self._db_is_today(db_key):
-      self.log('[%s] Resetting checkin time to %s',
-          unit['name'], self.default_checkin_time)
+      self.log('Resetting checkin time to %s', self.default_checkin_time)
       self.call_service(
           'input_datetime/set_datetime',
           service_data={'time': self.default_checkin_time},
@@ -163,78 +160,70 @@ class AirbnbManagement(Hass):
       self._db_set_today(db_key)
 
 
-  def cleaner_alert(self, unit: Unit):
+  def cleaner_alert(self):
     """Check if cleaner has arrived on time; alert if not.
-
-    Args:
-        unit (Unit): The unit
     """
     ####### Check that the cleaners have started
-    db_key = f'{ unit['code'] }_last_cleaner_check'
+    db_key = 'last_cleaner_check'
 
-    if (datetime.now().time() >self.cleaner_check_time
+    if (datetime.now().time() > self.cleaner_check_time
         and not self._db_is_today(db_key)):
 
-      guest_sensor = f'sensor.{ unit['code'] }_front_door_last_seen_guest'
-      fairies_sensor = (f'sensor.{ unit['code'] }_front_door_last_seen_'
-                         'cleaner_cleaning_fairies')
+      sensor_base = f'sensor.{ self.unit['code'] }_front_door_last_seen'
+      guest_sensor = f'{ sensor_base }_guest'
+      fairies_sensor = f'{ sensor_base }_cleaner_cleaning_fairies'
+
       guest_unlock = self._get_state_datetime(guest_sensor)
       fairies_unlock = self._get_state_datetime(fairies_sensor)
       log_obj = {'guest_unlock': guest_unlock, 'fairies_unlock': fairies_unlock}
 
       if guest_unlock > fairies_unlock:
         # Guest unlocked the door more recently than the cleaning fairies
-        self.log('[%s] - ALERT - Checked for recent cleaning: %s',
-            unit['name'], log_obj)
+        self.log('ALERT - Checked for recent cleaning: %s', log_obj)
 
-
-        # 2025-09-14 22:49:12.914903 WARNING HASS: Error with websocket result: invalid_format: required key not provided @ data['message']
+        # TODO: Make configurable
         # send alerts
         # Send page email
         self.call_service(
-            'notify/mail_page_amzn',
-            service_data={'target': 'jrshann@amazon.com',
-                          'title': 'Check Cleaners'})
+          'notify/mail_page_amzn',
+          service_data={'target': 'jrshann@amazon.com',
+                        'title': f'[{ self.unit["name"] }] Check Cleaners',
+                        'message': f'Check cleaners for { self.unit["name"] }'})
 
         # Send Maria SMS
         self.call_service(
-            'notify/mail_page_amzn',
-            service_data={'target': '14158897287@msg.fi.google.com',
-                          'title': 'Check Cleaners'})
+          'notify/mail_page_amzn',
+          service_data={'target': '14158897287@msg.fi.google.com',
+                        'title': f'[{ self.unit["name"] }] Check Cleaners',
+                        'message': f'Check cleaners for { self.unit["name"] }'})
 
       else:
-        self.log('[%s] - OK - Checked for recent cleaning: %s',
-            unit['name'], log_obj)
-
+        self.log('OK - Checked for recent cleaning: %s', log_obj)
 
       self._db_set_today(db_key)
 
-  def hvac_off(self, unit: Unit):
+  def hvac_off(self):
     """Turn off the HVAC after checkout time.
-
-    Args:
-        unit (Unit): The unit
     """
     ######## Turn off the AC on checkout day
-    db_key = f'{ unit['code'] }_last_hvac_off'
+    db_key = 'last_hvac_off'
+
     if (datetime.now().time() > self.checkout_time
         and not self._db_is_today(db_key)):
-      self.log('[%s] Turning off thermostat', unit['name'])
+      self.log('Turning off thermostat')
+
       self.call_service(
           'climate/turn_off',
-          target={'entity_id': unit['thermostat_key']})
+          target={'entity_id': self.unit['thermostat_key']})
+
       self._db_set_today(db_key)
 
-  def hvac_on(self, unit: Unit):
+  def hvac_on(self):
     """Turn on the HVAC before checkin time.
-
-    Args:
-        unit (Unit): The unit
     """
     ###### Turn on the AC
-    db_key = f'{ unit['code'] }_last_hvac_on'
-    entity_key = f'input_datetime.str_{ unit['code'] }_checkin_time'
-
+    db_key = 'last_hvac_on'
+    entity_key = f'input_datetime.str_{ self.unit['code'] }_checkin_time'
     checkin_time = time.fromisoformat(str(self.get_state(entity_key)))
 
     # TODO: Calculate the time needed to adjust the tempeature
@@ -242,11 +231,10 @@ class AirbnbManagement(Hass):
     # TODO: Turn on ceiling fans
     if (self._sub_time(checkin_time, datetime.now().time()) < 30
         and not self._db_is_today(db_key)):
-
-      self.log('[%s] Turning on thermostat', unit['name'])
+      self.log('Turning on thermostat')
       self.call_service(
           'climate/set_temperature',
-          target= {'entity_id': unit['thermostat_key']},
+          target= {'entity_id': self.unit['thermostat_key']},
           hvac_mode='cool',
           temperature=23,
       )
