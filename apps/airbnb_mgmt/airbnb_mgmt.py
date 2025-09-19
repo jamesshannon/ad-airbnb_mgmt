@@ -3,6 +3,7 @@ from datetime import datetime
 from datetime import time
 from datetime import timedelta
 import os
+import re
 import shelve
 import typing as t
 
@@ -59,7 +60,7 @@ class AirbnbManagement(Hass):
       'thermostat_key': self.args['thermostat_key'],
     }
 
-    # Execute the checks immediately, and every x minutes
+    # Execute the check every x minutes
     self.run_every(self.check_mgmt, interval=(self.check_interval_mins * 60))
 
   def terminate(self):
@@ -70,7 +71,7 @@ class AirbnbManagement(Hass):
     self.db.close()
 
   def check_mgmt(self, **kwargs: dict[str, t.Any]):
-    self.log('Executing STR Management activities')
+    self.log('Executing Airbnb Management activities')
 
     # Get the relevant rental events for this unit
     rental_events = self._get_rental_events(self.unit['cal_code'])
@@ -169,17 +170,17 @@ class AirbnbManagement(Hass):
     if (datetime.now().time() > self.cleaner_check_time
         and not self._db_is_today(db_key)):
 
-      sensor_base = f'sensor.{ self.unit['code'] }_front_door_last_seen'
-      guest_sensor = f'{ sensor_base }_guest'
-      fairies_sensor = f'{ sensor_base }_cleaner_cleaning_fairies'
+      unlock_times = self._get_last_unlocks()
+      if not unlock_times['cleaner_unlock'] or not unlock_times['guest_unlock']:
+        # This is unlikely, and probably means something is wrong
+        # Log an error, but we'll automatically try again soon
+        self.error('Could not determine last unlock times: %s', unlock_times)
 
-      guest_unlock = self._get_state_datetime(guest_sensor)
-      fairies_unlock = self._get_state_datetime(fairies_sensor)
-      log_obj = {'guest_unlock': guest_unlock, 'fairies_unlock': fairies_unlock}
+      assert unlock_times['cleaner_unlock'] and unlock_times['guest_unlock']
 
-      if guest_unlock > fairies_unlock:
+      if unlock_times['guest_unlock'] > unlock_times['cleaner_unlock']:
         # Guest unlocked the door more recently than the cleaning fairies
-        self.log('ALERT - Checked for recent cleaning: %s', log_obj)
+        self.log('ALERT - Checked for recent cleaning: %s', unlock_times)
 
         # TODO: Make configurable
         # send alerts
@@ -198,7 +199,7 @@ class AirbnbManagement(Hass):
                         'message': f'Check cleaners for { self.unit["name"] }'})
 
       else:
-        self.log('OK - Checked for recent cleaning: %s', log_obj)
+        self.log('OK - Checked for recent cleaning: %s', unlock_times)
 
       self._db_set_today(db_key)
 
@@ -240,18 +241,42 @@ class AirbnbManagement(Hass):
       )
       self._db_set_today(db_key)
 
-  def _get_state_time(
-      self, entity_id: str, attribute: str | None = None) -> time:
-    """Get state value from HA entity as a time.
-
-    Args:
-        entity_id (str): HA entity ID
-        attribute (str | None, optional): HA entity attribute. Defaults to None.
+  def _get_last_unlocks(self) -> dict[str, datetime | None]:
+    """Get the most recent unlock times for cleaners and guests.
 
     Returns:
-        datetime: State value as time
+        dict[str, datetime | None]: Dictionary with keys 'cleaner_unlock' and
+            'guest_unlock'.
     """
-    return self._get_state_datetime(entity_id, attribute).time()
+    cleaner_unlock = None
+    guest_unlock = None
+
+    # TODO: Make these configurable
+    cleaner_re = re.compile(r'^Maria\s+Reno\s+cleaning\s+fairies',
+                            re.IGNORECASE)
+    guest_re = re.compile(r'^\d{2}/\d{2}', re.IGNORECASE)
+
+    # TODO: Make the sensor entity configurable
+    unlocks = self.get_history(
+        f'sensor.{ self.unit["code"] }_front_door_operator',
+        days=15, no_attributes='true') # type: ignore (Filed bug with AppDaemon)
+
+    # The return will always be a list of lists, even if no events
+    assert unlocks
+
+    # Work backwards to find the most recent
+    for unlock in reversed(unlocks[0]):
+      if not cleaner_unlock and cleaner_re.search(unlock['state']):
+        cleaner_unlock = unlock['last_changed']
+
+      if not guest_unlock and guest_re.search(unlock['state']):
+        guest_unlock = unlock['last_changed']
+
+    return {
+      'cleaner_unlock': cleaner_unlock,
+      'guest_unlock': guest_unlock
+    }
+
 
   def _get_state_datetime(
       self, entity_id: str, attribute: str | None = None) -> datetime:
@@ -295,6 +320,7 @@ class AirbnbManagement(Hass):
         key (str): DB record key
     """
     self.db[key] = date.today()
+
 
   def _db_is_today(self, key: str) -> bool:
     """Shortcut to check if DB record value is equal to today
