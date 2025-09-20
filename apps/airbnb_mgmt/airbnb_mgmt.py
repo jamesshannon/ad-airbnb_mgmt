@@ -11,8 +11,10 @@ from appdaemon.plugins.hass import Hass # pyright: ignore
 
 # pyright: reportUnknownMemberType=false
 
-MY_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_BASE = os.path.join(MY_DIR, 'state')
+# Directory for database files. HACS rewrites the app directory so we keep
+# the database in the parent directory.
+MY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_BASE = os.path.join(MY_DIR, 'airbnb_state')
 
 class CalendarEventInfo(t.TypedDict):
   """ Data about each Rental Control calendar event
