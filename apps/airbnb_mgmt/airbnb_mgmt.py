@@ -16,6 +16,8 @@ from appdaemon.plugins.hass import Hass # pyright: ignore
 MY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_BASE = os.path.join(MY_DIR, 'airbnb_state')
 
+TEMP_RANGE = (17, 23)
+
 class CalendarEventInfo(t.TypedDict):
   """ Data about each Rental Control calendar event
   """
@@ -53,7 +55,6 @@ class AirbnbManagement(Hass):
         time.fromisoformat(
             t.cast(str, self.args.get('cleaner_check_time', '14:00:00')))
 
-
     # Expect all unit parameters as top-level args
     self.unit: dict[str, str] = {
       'name': self.args['name'],
@@ -64,6 +65,7 @@ class AirbnbManagement(Hass):
 
     # Execute the check every x minutes
     self.run_every(self.check_mgmt, interval=(self.check_interval_mins * 60))
+
 
   def terminate(self):
     """ AppDaemon app cleanup
@@ -179,10 +181,13 @@ class AirbnbManagement(Hass):
         self.error('Could not determine last unlock times: %s', unlock_times)
 
       assert unlock_times['cleaner_unlock'] and unlock_times['guest_unlock']
+      unlock_times = t.cast(dict[str, datetime], unlock_times)
+
+      unlock_times_str = {k: v.isoformat() for k, v in unlock_times.items()}
 
       if unlock_times['guest_unlock'] > unlock_times['cleaner_unlock']:
         # Guest unlocked the door more recently than the cleaning fairies
-        self.log('ALERT - Checked for recent cleaning: %s', unlock_times)
+        self.log('ALERT - Checked for recent cleaning: %s', unlock_times_str)
 
         # TODO: Make configurable
         # send alerts
@@ -201,7 +206,7 @@ class AirbnbManagement(Hass):
                         'message': f'Check cleaners for { self.unit["name"] }'})
 
       else:
-        self.log('OK - Checked for recent cleaning: %s', unlock_times)
+        self.log('OK - Checked for recent cleaning: %s', unlock_times_str)
 
       self._db_set_today(db_key)
 
@@ -230,17 +235,35 @@ class AirbnbManagement(Hass):
     checkin_time = time.fromisoformat(str(self.get_state(entity_key)))
 
     # TODO: Calculate the time needed to adjust the tempeature
-    # TODO: Turn on heat
     # TODO: Turn on ceiling fans
-    if (self._sub_time(checkin_time, datetime.now().time()) < 30
+    if (self._sub_time(checkin_time, datetime.now().time()) < 90
         and not self._db_is_today(db_key)):
-      self.log('Turning on thermostat')
-      self.call_service(
-          'climate/set_temperature',
-          target= {'entity_id': self.unit['thermostat_key']},
-          hvac_mode='cool',
-          temperature=23,
-      )
+
+      Tlow = TEMP_RANGE[0]
+      Thigh = TEMP_RANGE[1]
+
+      Tcurrent = t.cast(float, self.get_state(self.unit['thermostat_key'],
+                                              'current_temperature'))
+      Tforecast = self._get_weather_forecast()['temp']
+
+      kwargs: dict[str, str | float] | None = None
+      if Tcurrent <= Tlow or Tforecast <= Tlow:
+        kwargs = {'hvac_mode': 'heat', 'temperature': Tlow}
+      elif Tcurrent >= Thigh or Tforecast >= Thigh:
+        kwargs = {'hvac_mode': 'cool', 'temperature': Thigh}
+      else:
+        self.call_service(
+          'climate/turn_off',
+          target={'entity_id': self.unit['thermostat_key']})
+
+      if kwargs:
+        self.log('Turning on thermostat')
+        self.call_service(
+            'climate/set_temperature',
+            target= {'entity_id': self.unit['thermostat_key']},
+            service_data=kwargs
+        )
+
       self._db_set_today(db_key)
 
   def _get_last_unlocks(self) -> dict[str, datetime | None]:
@@ -278,6 +301,19 @@ class AirbnbManagement(Hass):
       'cleaner_unlock': cleaner_unlock,
       'guest_unlock': guest_unlock
     }
+
+
+  def _get_weather_forecast(self, hours: int = 6) -> dict[str, float]:
+    """Get weather forecast for next x hours."""
+    resp = self.call_service('weather/get_forecasts',
+                            type='hourly',
+                            target={'entity_id': 'weather.forecast_home'})
+    forecasts = resp['result']['response']['weather.forecast_home']['forecast']
+    temps = [f['temperature'] for f in forecasts]
+
+    assert len(forecasts) >= hours
+
+    return {'temp': sum(temps[:hours]) / hours}
 
 
   def _get_state_datetime(
