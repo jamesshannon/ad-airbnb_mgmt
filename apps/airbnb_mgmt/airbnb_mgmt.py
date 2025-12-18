@@ -16,8 +16,6 @@ from appdaemon.plugins.hass import Hass # pyright: ignore
 MY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_BASE = os.path.join(MY_DIR, 'airbnb_state')
 
-TEMP_RANGE = (17, 23)
-
 class CalendarEventInfo(t.TypedDict):
   """ Data about each Rental Control calendar event
   """
@@ -54,6 +52,9 @@ class AirbnbManagement(Hass):
     self.cleaner_check_time: time = \
         time.fromisoformat(
             t.cast(str, self.args.get('cleaner_check_time', '14:00:00')))
+
+    self.min_temp = t.cast(float, self.args.get('min_temp', 19))
+    self.max_temp = t.cast(float, self.args.get('max_temp', 24))
 
     # Expect all unit parameters as top-level args
     self.unit: dict[str, str] = {
@@ -234,34 +235,35 @@ class AirbnbManagement(Hass):
     entity_key = f'input_datetime.str_{ self.unit['code'] }_checkin_time'
     checkin_time = time.fromisoformat(str(self.get_state(entity_key)))
 
-    # TODO: Calculate the time needed to adjust the tempeature
+    # TODO: Calculate the time needed to adjust the temperature
     # TODO: Turn on ceiling fans
     if (self._sub_time(checkin_time, datetime.now().time()) < 90
         and not self._db_is_today(db_key)):
 
-      Tlow = TEMP_RANGE[0]
-      Thigh = TEMP_RANGE[1]
-
-      Tcurrent = t.cast(float, self.get_state(self.unit['thermostat_key'],
+      current_temp = t.cast(float, self.get_state(self.unit['thermostat_key'],
                                               'current_temperature'))
-      Tforecast = self._get_weather_forecast()['temp']
+      forecast_temp = self._get_weather_forecast()['temp']
 
-      kwargs: dict[str, str | float] | None = None
-      if Tcurrent <= Tlow or Tforecast <= Tlow:
-        kwargs = {'hvac_mode': 'heat', 'temperature': Tlow}
-      elif Tcurrent >= Thigh or Tforecast >= Thigh:
-        kwargs = {'hvac_mode': 'cool', 'temperature': Thigh}
+      self.log('Evaluating current temp (%sc) and forecasted temp (%sc)',
+               current_temp, forecast_temp)
+
+      t_args: dict[str, str | float] = {}
+      if current_temp <= self.min_temp or forecast_temp <= self.min_temp:
+        t_args = {'hvac_mode': 'heat', 'temperature': self.min_temp}
+      elif current_temp >= self.max_temp or forecast_temp >= self.max_temp:
+        t_args = {'hvac_mode': 'cool', 'temperature': self.max_temp}
       else:
+        self.log('Turning off thermostat')
         self.call_service(
           'climate/turn_off',
           target={'entity_id': self.unit['thermostat_key']})
 
-      if kwargs:
-        self.log('Turning on thermostat')
+      if t_args:
+        self.log('Turning on thermostat (%s)', t_args)
         self.call_service(
             'climate/set_temperature',
             target= {'entity_id': self.unit['thermostat_key']},
-            service_data=kwargs
+            service_data=t_args
         )
 
       self._db_set_today(db_key)

@@ -10,4 +10,7 @@ airbnb_main:
   code: main
   cal_code: airbnb
   thermostat_key: climate.t9_thermostat
+
+  min_temp: 19
+  max_temp: 24
 ```
