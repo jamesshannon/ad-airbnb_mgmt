@@ -180,8 +180,8 @@ class AirbnbManagement(Hass):
         # This is unlikely, and probably means something is wrong
         # Log an error, but we'll automatically try again soon
         self.error('Could not determine last unlock times: %s', unlock_times)
+        return
 
-      assert unlock_times['cleaner_unlock'] and unlock_times['guest_unlock']
       unlock_times = t.cast(dict[str, datetime], unlock_times)
 
       unlock_times_str = {k: v.isoformat() for k, v in unlock_times.items()}
@@ -289,7 +289,9 @@ class AirbnbManagement(Hass):
         days=15, no_attributes='true') # type: ignore (Filed bug with AppDaemon)
 
     # The return will always be a list of lists, even if no events
-    assert unlocks
+    assert unlocks, 'No unlocks'
+
+    self.log('Unlocks: %s', unlocks, level='DEBUG')
 
     # Work backwards to find the most recent
     for unlock in reversed(unlocks[0]):
